@@ -10,7 +10,7 @@ It is designed for **single-document analysis** and **high-volume folder triage*
 > **Required dependencies:** None beyond PowerShell/.NET  
 > **Optional corroboration:** qpdf, ExifTool, pdfsig, Didier Stevens' `pdfid.py`
 
-![PDF Hexmator bulk dashboard](docs/images/bulk-dashboard.png)
+![PDF Hexmator bulk dashboard](images/bulk-dashboard.png)
 
 ## Quick overview
 
@@ -172,7 +172,7 @@ Object 17 0
 
 This helps move the analysis from **“the file contains revisions”** toward **“these object definitions changed between revisions.”**
 
-![PDF Hexmator detailed report](docs/images/document-report.png)
+![PDF Hexmator detailed report](images/document-report.png)
 
 > Object-level diffing compares serialized indirect-object definitions. It does not yet render a page-level visual diff or semantically decode every stream.
 
@@ -419,10 +419,9 @@ PDF-Hexmator/
 ├── CONTRIBUTING.md
 ├── SECURITY.md
 │
-├── docs/
-│   └── images/
-│       ├── bulk-dashboard.png
-│       └── document-report.png
+├── images/
+│   ├── bulk-dashboard.png
+│   └── document-report.png
 │
 ├── tests/
 │   ├── PDFHexmator.Tests.ps1
