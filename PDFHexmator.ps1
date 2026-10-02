@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Bulk-capable PDF forensic triage for structural evidence of incremental updates,
     linearization, malformed structure, metadata history, signatures, appended data,
@@ -11,15 +11,20 @@
       - one or more folders containing hundreds or thousands of PDFs
       - optionally, all PDF files in nested subdirectories
 
-    Each PDF is processed independently and read-only. In bulk mode, a malformed or
-    unsupported PDF is recorded as an error without stopping the remainder of the scan.
+    Analysis is read-only. In bulk mode PDF Hexmator first calculates SHA-256 for every
+    discovered PDF, groups byte-identical files, and performs deep PDF analysis only once
+    per unique hash. Every original source path remains represented in the report beneath
+    its hash group. A malformed or unsupported unique PDF is recorded as an error without
+    stopping the remainder of the scan.
 
     Bulk output includes:
       - searchable/sortable self-contained HTML case report
       - CSV summary for spreadsheet/filtering workflows
       - JSON case summary
-      - exact SHA-256 duplicate grouping
-      - optional per-document detailed HTML/JSON reports
+      - hash-first SHA-256 de-duplication before deep PDF analysis
+      - nested identical-file groups in the consolidated report
+      - complete source-file inventory mapped to each hash group
+      - optional per-unique-document detailed HTML/JSON reports
       - optional carving of recoverable logical revisions
       - object-level revision diffing for redefined indirect objects
       - a forensic case manifest and SHA-256 output inventory
@@ -39,15 +44,15 @@
     For a single PDF the historical per-file output naming is retained.
 
 .PARAMETER DetailedReports
-    In bulk mode, also generate the full per-document HTML/JSON report for each PDF.
-    This is optional because thousands of PDFs can otherwise create thousands of files.
+    In bulk mode, generate one full HTML/JSON report for each unique SHA-256 hash group.
+    Byte-identical copies share the representative file's analysis and do not create redundant reports.
 
 .PARAMETER ExtractRevisions
     Carve recoverable logical PDF revisions. Linearization-only bootstrap sections are
     excluded from revision carving.
 
 .PARAMETER CaseName
-    Title case/report annotated within the consolidated HTML report.
+    Friendly case/report title for the consolidated HTML report.
 
 .PARAMETER NoHtml
     Disable HTML output.
@@ -56,11 +61,11 @@
     Disable JSON output.
 
 .PARAMETER NoCsv
-    Disable the consolidated CSV summary in bulk mode.
+    Disable both the hash-group summary CSV and source-file inventory CSV in bulk mode.
 
 .PARAMETER StopOnError
-    Stop the bulk scan at the first document that cannot be analyzed. By default, errors
-    are logged in the master report and processing continues.
+    Stop the bulk scan at the first hash or unique-document analysis error. By default,
+    errors are logged in the master report and processing continues.
 
 .PARAMETER ExternalValidation
     When enabled, attempt corroborating checks with installed external utilities such as
@@ -89,10 +94,10 @@
     .\PDFHexmator.ps1 -Path 'C:\Evidence' -Recurse -DetailedReports -ExtractRevisions -ExternalValidation -CaseName 'Case 2026-001'
 
 .NOTES
-    Version 2.0.0
+    Version 2.1.1
     Designed for Windows PowerShell 5.1+ and PowerShell 7+.
     Files are processed sequentially so bulk scans do not hold every PDF in memory at once.
-    v2 adds case manifests, object-level revision diffs, and optional external corroboration.
+    v2.1 adds hash-first de-duplication so identical PDFs are hashed but deeply analyzed only once.
 #>
 
 [CmdletBinding()]
@@ -111,7 +116,7 @@ param(
 
     [switch]$ExtractRevisions,
 
-    [string]$CaseName = 'PDF Hexmator',
+    [string]$CaseName = 'PDF Hexmator Bulk Forensic Triage',
 
     [switch]$NoHtml,
 
@@ -572,6 +577,49 @@ function New-HtmlTable {
     return $sb.ToString()
 }
 
+function Get-SafePropertySum {
+    <#
+    .SYNOPSIS
+        StrictMode-safe numeric property summation.
+
+    .DESCRIPTION
+        Windows PowerShell 5.1 can return a Measure-Object result without a
+        materialized Sum property when the filtered input is empty. Under
+        Set-StrictMode, directly reading .Sum can then throw
+        PropertyNotFoundStrict.
+
+        This helper performs the aggregation explicitly and therefore returns
+        0 for empty input and a stable Int64 sum for one or more objects.
+    #>
+    param(
+        [AllowNull()]
+        [object[]]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Property
+    )
+
+    [long]$sum = 0
+
+    foreach ($item in @($InputObject)) {
+        if ($null -eq $item) { continue }
+
+        $propertyInfo = $item.PSObject.Properties[$Property]
+        if ($null -eq $propertyInfo -or $null -eq $propertyInfo.Value) {
+            continue
+        }
+
+        try {
+            $sum += [long]$propertyInfo.Value
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $sum
+}
+
 function Get-SafeFileName {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -837,214 +885,359 @@ function Set-DuplicateGroups {
     return $groups.Count
 }
 
+function Get-PdfHashInventory {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Files
+    )
+
+    $records = New-Object System.Collections.Generic.List[object]
+    $total = $Files.Count
+
+    for ($i = 0; $i -lt $total; $i++) {
+        $file = $Files[$i]
+        $index = $i + 1
+        $pct = if ($total -gt 0) { [int](($index / [double]$total) * 100) } else { 100 }
+
+        Write-Progress -Activity 'PDF Hexmator - Phase 1 of 2: SHA-256 inventory' `
+            -Status ("[{0:N0}/{1:N0}] {2}" -f $index, $total, $file.Name) `
+            -PercentComplete $pct
+
+        $hash = $null
+        $status = 'Hashed'
+        $errorText = ''
+        try {
+            $hash = Get-FileSha256 -LiteralPath $file.FullName
+            if ([string]::IsNullOrWhiteSpace($hash)) {
+                throw 'SHA-256 calculation returned no value.'
+            }
+        }
+        catch {
+            $status = 'HashError'
+            $errorText = $_.Exception.Message
+        }
+
+        $records.Add([pscustomobject]@{
+            Index = $index
+            Status = $status
+            FileName = $file.Name
+            FullPath = $file.FullName
+            Directory = $file.DirectoryName
+            SizeBytes = [long]$file.Length
+            FileSystemLastWriteTime = $file.LastWriteTime.ToString('o')
+            SHA256 = $hash
+            HashGroup = ''
+            GroupSize = 0
+            RepresentativeFullPath = ''
+            IsRepresentative = $false
+            Assessment = ''
+            Error = $errorText
+        })
+    }
+
+    Write-Progress -Activity 'PDF Hexmator - Phase 1 of 2: SHA-256 inventory' -Completed
+    return $records.ToArray()
+}
+
+function New-PdfHashGroups {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Inventory
+    )
+
+    $valid = @($Inventory | Where-Object { $_.Status -eq 'Hashed' -and -not [string]::IsNullOrWhiteSpace($_.SHA256) })
+    $rawGroups = @(
+        $valid |
+            Group-Object SHA256 |
+            Sort-Object @{ Expression = { ($_.Group | Measure-Object -Property Index -Minimum).Minimum }; Ascending = $true }
+    )
+
+    $groups = New-Object System.Collections.Generic.List[object]
+    $groupIndex = 0
+
+    foreach ($raw in $rawGroups) {
+        $groupIndex++
+        $groupId = 'HASH-{0:D6}' -f $groupIndex
+        $members = @($raw.Group | Sort-Object Index)
+        $representative = $members[0]
+
+        foreach ($member in $members) {
+            $member.HashGroup = $groupId
+            $member.GroupSize = $members.Count
+            $member.RepresentativeFullPath = $representative.FullPath
+            $member.IsRepresentative = ($member.FullPath -eq $representative.FullPath)
+        }
+
+        $groups.Add([pscustomobject]@{
+            GroupIndex = $groupIndex
+            HashGroup = $groupId
+            SHA256 = [string]$raw.Name
+            FileCount = $members.Count
+            DuplicateCopies = [Math]::Max(0, $members.Count - 1)
+            IsDuplicateSet = ($members.Count -gt 1)
+            Representative = $representative
+            Files = $members
+        })
+    }
+
+    return $groups.ToArray()
+}
+
+function Convert-AnalysisToHashGroupSummary {
+    param(
+        [Parameter(Mandatory = $true)][object]$HashGroup,
+        [Parameter(Mandatory = $true)][object]$Report,
+        [string]$DetailHtmlRelative,
+        [string]$DetailJsonRelative
+    )
+
+    $base = Convert-AnalysisToBulkSummary `
+        -Report $Report `
+        -Index ([int]$HashGroup.GroupIndex) `
+        -DetailHtmlRelative $DetailHtmlRelative `
+        -DetailJsonRelative $DetailJsonRelative
+
+    $memberPaths = @($HashGroup.Files | ForEach-Object { $_.FullPath })
+
+    return [pscustomobject]@{
+        Index = [int]$HashGroup.GroupIndex
+        HashGroup = [string]$HashGroup.HashGroup
+        Status = [string]$base.Status
+        SHA256 = [string]$HashGroup.SHA256
+        FileCount = [int]$HashGroup.FileCount
+        DuplicateCopies = [int]$HashGroup.DuplicateCopies
+        IsDuplicateSet = [bool]$HashGroup.IsDuplicateSet
+        RepresentativeFileName = [string]$HashGroup.Representative.FileName
+        RepresentativeFullPath = [string]$HashGroup.Representative.FullPath
+        RepresentativeDirectory = [string]$HashGroup.Representative.Directory
+        FileName = [string]$HashGroup.Representative.FileName
+        FullPath = [string]$HashGroup.Representative.FullPath
+        Directory = [string]$HashGroup.Representative.Directory
+        SizeBytes = [long]$base.SizeBytes
+        MD5 = [string]$base.MD5
+        PdfVersion = [string]$base.PdfVersion
+        Assessment = [string]$base.Assessment
+        AssessmentDetail = [string]$base.AssessmentDetail
+        Linearized = [bool]$base.Linearized
+        LinearizationLengthMatch = [bool]$base.LinearizationLengthMatch
+        LogicalRevisions = [int]$base.LogicalRevisions
+        PhysicalEofMarkers = [int]$base.PhysicalEofMarkers
+        StartXrefCount = [int]$base.StartXrefCount
+        ForwardPrev = [int]$base.ForwardPrev
+        BackwardPrev = [int]$base.BackwardPrev
+        RedefinedObjects = [int]$base.RedefinedObjects
+        ChangedObjectDefinitions = [int]$base.ChangedObjectDefinitions
+        SignatureByteRanges = [int]$base.SignatureByteRanges
+        ExternalToolsAvailable = [int]$base.ExternalToolsAvailable
+        ExternalToolFailures = [int]$base.ExternalToolFailures
+        ActiveContentIndicators = [int]$base.ActiveContentIndicators
+        HighFindings = [int]$base.HighFindings
+        MediumFindings = [int]$base.MediumFindings
+        LowFindings = [int]$base.LowFindings
+        InfoFindings = [int]$base.InfoFindings
+        Producer = [string]$base.Producer
+        Creator = [string]$base.Creator
+        CreationDate = [string]$base.CreationDate
+        ModificationDate = [string]$base.ModificationDate
+        FileSystemLastWriteTime = [string]$HashGroup.Representative.FileSystemLastWriteTime
+        MemberPaths = ($memberPaths -join ' | ')
+        Files = @($HashGroup.Files)
+        DetailHtml = $DetailHtmlRelative
+        DetailJson = $DetailJsonRelative
+        Error = ''
+    }
+}
+
+function New-HashGroupErrorSummary {
+    param(
+        [Parameter(Mandatory = $true)][object]$HashGroup,
+        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $memberPaths = @($HashGroup.Files | ForEach-Object { $_.FullPath })
+    return [pscustomobject]@{
+        Index = [int]$HashGroup.GroupIndex
+        HashGroup = [string]$HashGroup.HashGroup
+        Status = 'Error'
+        SHA256 = [string]$HashGroup.SHA256
+        FileCount = [int]$HashGroup.FileCount
+        DuplicateCopies = [int]$HashGroup.DuplicateCopies
+        IsDuplicateSet = [bool]$HashGroup.IsDuplicateSet
+        RepresentativeFileName = [string]$HashGroup.Representative.FileName
+        RepresentativeFullPath = [string]$HashGroup.Representative.FullPath
+        RepresentativeDirectory = [string]$HashGroup.Representative.Directory
+        FileName = [string]$HashGroup.Representative.FileName
+        FullPath = [string]$HashGroup.Representative.FullPath
+        Directory = [string]$HashGroup.Representative.Directory
+        SizeBytes = [long]$HashGroup.Representative.SizeBytes
+        MD5 = ''
+        PdfVersion = ''
+        Assessment = 'ANALYSIS ERROR'
+        AssessmentDetail = $ErrorRecord.Exception.Message
+        Linearized = $false
+        LinearizationLengthMatch = $false
+        LogicalRevisions = 0
+        PhysicalEofMarkers = 0
+        StartXrefCount = 0
+        ForwardPrev = 0
+        BackwardPrev = 0
+        RedefinedObjects = 0
+        ChangedObjectDefinitions = 0
+        SignatureByteRanges = 0
+        ExternalToolsAvailable = 0
+        ExternalToolFailures = 0
+        ActiveContentIndicators = 0
+        HighFindings = 0
+        MediumFindings = 0
+        LowFindings = 0
+        InfoFindings = 0
+        Producer = ''
+        Creator = ''
+        CreationDate = ''
+        ModificationDate = ''
+        FileSystemLastWriteTime = [string]$HashGroup.Representative.FileSystemLastWriteTime
+        MemberPaths = ($memberPaths -join ' | ')
+        Files = @($HashGroup.Files)
+        DetailHtml = ''
+        DetailJson = ''
+        Error = $ErrorRecord.Exception.Message
+    }
+}
+
 function New-BulkHtmlReport {
     param(
         [Parameter(Mandatory = $true)][object]$CaseReport,
         [Parameter(Mandatory = $true)][string]$OutputPath
     )
 
-    $docs = @($CaseReport.Documents)
+    $groups = @($CaseReport.HashGroups)
+    $hashErrors = @($CaseReport.HashErrors)
     $stats = $CaseReport.Statistics
     $rows = New-Object System.Text.StringBuilder
 
-    foreach ($d in $docs) {
+    foreach ($g in $groups) {
         $assessmentClass = 'normal'
-        if ($d.Status -eq 'Error') {
-            $assessmentClass = 'error'
-        }
-        elseif ($d.Assessment -like 'STRONG EVIDENCE*') {
-            $assessmentClass = 'high'
-        }
-        elseif ($d.Assessment -like 'INDICATORS*' -or $d.Assessment -like '*REVIEW*') {
-            $assessmentClass = 'review'
-        }
-        elseif ($d.Linearized) {
-            $assessmentClass = 'linearized'
-        }
+        if ($g.Status -eq 'Error') { $assessmentClass = 'error' }
+        elseif ($g.Assessment -like 'STRONG EVIDENCE*') { $assessmentClass = 'high' }
+        elseif ($g.Assessment -like 'INDICATORS*' -or $g.Assessment -like '*REVIEW*') { $assessmentClass = 'review' }
+        elseif ($g.Linearized) { $assessmentClass = 'linearized' }
 
         $detailLink = ''
-        if (-not [string]::IsNullOrWhiteSpace($d.DetailHtml)) {
-            $href = [System.Uri]::EscapeUriString(($d.DetailHtml -replace '\\','/'))
-            $detailLink = '<a class="detail-link" href="' + (HtmlEncode $href) + '">View</a>'
+        if (-not [string]::IsNullOrWhiteSpace($g.DetailHtml)) {
+            $href = [System.Uri]::EscapeUriString(($g.DetailHtml -replace '\\','/'))
+            $detailLink = '<a class="detail-link" href="' + (HtmlEncode $href) + '">View analysis</a>'
         }
 
-        $dup = if ($d.DuplicateCount -gt 1) {
-            (HtmlEncode ("{0} ({1})" -f $d.DuplicateGroup, $d.DuplicateCount))
-        } else {
-            ''
+        $memberHtml = New-Object System.Text.StringBuilder
+        [void]$memberHtml.Append('<details class="members"><summary>')
+        if ($g.FileCount -gt 1) {
+            [void]$memberHtml.Append((HtmlEncode ("{0} identical PDFs - {1} duplicate cop{2}" -f $g.FileCount, $g.DuplicateCopies, $(if ($g.DuplicateCopies -eq 1) {'y'} else {'ies'}))))
         }
+        else {
+            [void]$memberHtml.Append('1 source PDF')
+        }
+        [void]$memberHtml.Append('</summary><div class="member-list">')
+        foreach ($m in @($g.Files)) {
+            $role = if ($m.IsRepresentative) { '<span class="rep">ANALYZED</span>' } else { '<span class="dup">IDENTICAL</span>' }
+            [void]$memberHtml.Append('<div class="member">' + $role + '<code>' + (HtmlEncode $m.FullPath) + '</code></div>')
+        }
+        [void]$memberHtml.Append('</div></details>')
 
-        $sizeMB = [Math]::Round(([double]$d.SizeBytes / 1MB), 2)
-        $prevText = "{0}/{1}" -f $d.BackwardPrev, $d.ForwardPrev
-        $findText = "{0}/{1}" -f $d.HighFindings, $d.MediumFindings
+        $sizeMB = [Math]::Round(([double]$g.SizeBytes / 1MB), 2)
+        $prevText = "{0}/{1}" -f $g.BackwardPrev, $g.ForwardPrev
+        $findText = "{0}/{1}" -f $g.HighFindings, $g.MediumFindings
+        $shortHash = if ($g.SHA256.Length -gt 16) { $g.SHA256.Substring(0,16) + '…' } else { $g.SHA256 }
 
         [void]$rows.Append(
             '<tr class="' + $assessmentClass + '"' +
-            ' data-status="' + (HtmlEncode $d.Status) + '"' +
+            ' data-status="' + (HtmlEncode $g.Status) + '"' +
             ' data-assessment="' + (HtmlEncode $assessmentClass) + '"' +
-            ' data-linearized="' + ($(if ($d.Linearized) {'1'} else {'0'})) + '"' +
-            ' data-duplicate="' + ($(if ($d.DuplicateCount -gt 1) {'1'} else {'0'})) + '"' +
-            ' data-high="' + $d.HighFindings + '">' +
-            '<td class="num">' + $d.Index + '</td>' +
-            '<td class="file" title="' + (HtmlEncode $d.FullPath) + '"><strong>' + (HtmlEncode $d.FileName) + '</strong><div class="path">' + (HtmlEncode $d.Directory) + '</div></td>' +
-            '<td class="num" data-sort="' + $d.SizeBytes + '">' + $sizeMB + '</td>' +
-            '<td><span class="badge ' + $assessmentClass + '">' + (HtmlEncode $d.Assessment) + '</span></td>' +
-            '<td>' + (HtmlEncode $d.PdfVersion) + '</td>' +
-            '<td class="center">' + ($(if ($d.Linearized) {'Yes'} else {'No'})) + '</td>' +
-            '<td class="num">' + $d.LogicalRevisions + '</td>' +
-            '<td class="num">' + $d.PhysicalEofMarkers + '</td>' +
+            ' data-linearized="' + ($(if ($g.Linearized) {'1'} else {'0'})) + '"' +
+            ' data-duplicate="' + ($(if ($g.FileCount -gt 1) {'1'} else {'0'})) + '"' +
+            ' data-high="' + $g.HighFindings + '">' +
+            '<td class="num">' + $g.Index + '</td>' +
+            '<td><strong>' + (HtmlEncode $g.HashGroup) + '</strong><div class="hash" title="' + (HtmlEncode $g.SHA256) + '">' + (HtmlEncode $shortHash) + '</div></td>' +
+            '<td class="file"><strong>' + (HtmlEncode $g.RepresentativeFileName) + '</strong><div class="path">' + (HtmlEncode $g.RepresentativeDirectory) + '</div>' + $memberHtml.ToString() + '</td>' +
+            '<td class="num" data-sort="' + $g.FileCount + '">' + $g.FileCount + '</td>' +
+            '<td class="num" data-sort="' + $g.SizeBytes + '">' + $sizeMB + '</td>' +
+            '<td><span class="badge ' + $assessmentClass + '">' + (HtmlEncode $g.Assessment) + '</span></td>' +
+            '<td>' + (HtmlEncode $g.PdfVersion) + '</td>' +
+            '<td class="center">' + ($(if ($g.Linearized) {'Yes'} else {'No'})) + '</td>' +
+            '<td class="num">' + $g.LogicalRevisions + '</td>' +
+            '<td class="num">' + $g.PhysicalEofMarkers + '</td>' +
             '<td class="center" title="Backward / Forward">' + $prevText + '</td>' +
-            '<td class="num">' + $d.RedefinedObjects + '</td>' +
-            '<td class="num">' + $d.ChangedObjectDefinitions + '</td>' +
-            '<td class="num">' + $d.SignatureByteRanges + '</td>' +
-            '<td class="center" title="Available / Failures">' + $d.ExternalToolsAvailable + '/' + $d.ExternalToolFailures + '</td>' +
-            '<td class="num">' + $d.ActiveContentIndicators + '</td>' +
+            '<td class="num">' + $g.ChangedObjectDefinitions + '</td>' +
+            '<td class="num">' + $g.SignatureByteRanges + '</td>' +
+            '<td class="num">' + $g.ActiveContentIndicators + '</td>' +
             '<td class="center" title="High / Medium">' + $findText + '</td>' +
-            '<td>' + (HtmlEncode $d.Producer) + '</td>' +
-            '<td>' + (HtmlEncode $d.ModificationDate) + '</td>' +
-            '<td>' + $dup + '</td>' +
+            '<td>' + (HtmlEncode $g.Producer) + '</td>' +
+            '<td>' + (HtmlEncode $g.ModificationDate) + '</td>' +
             '<td>' + $detailLink + '</td>' +
             '</tr>'
         )
     }
 
     $css = @'
-:root{
-  --bg:#eef2f5;--panel:#fff;--text:#16202a;--muted:#65727f;--line:#d9e1e7;
-  --navy:#14283b;--blue:#245b86;--high:#982323;--highbg:#fff0f0;
-  --review:#946000;--reviewbg:#fff8e5;--ok:#176944;--okbg:#edf8f2;
-  --linear:#3d5680;--linearbg:#eef3fb;--err:#7c2733;--errbg:#fdecef;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Arial,sans-serif}
-header{background:var(--navy);color:#fff;padding:24px 30px}
-header h1{margin:0 0 5px;font-size:24px}
-header .sub{opacity:.8}
-main{max-width:1900px;margin:0 auto;padding:20px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:15px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.metric .value{font-size:26px;font-weight:700;line-height:1.1}
-.metric .label{color:var(--muted);margin-top:5px}
-.toolbar{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-bottom:12px}
-.toolbar input,.toolbar select{border:1px solid #c9d3db;border-radius:6px;padding:8px 10px;background:#fff}
-.toolbar input{min-width:330px;flex:1}
-.table-wrap{background:#fff;border:1px solid var(--line);border-radius:9px;overflow:auto;max-height:72vh}
-table{border-collapse:separate;border-spacing:0;width:100%;min-width:1750px}
-th,td{padding:8px 9px;border-bottom:1px solid #e6ebef;vertical-align:top}
-th{position:sticky;top:0;z-index:2;background:#eaf0f4;color:#31475b;text-align:left;cursor:pointer;white-space:nowrap}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-td.center{text-align:center}
-td.file{min-width:280px}
-.path{color:var(--muted);font-size:11px;margin-top:2px;max-width:430px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.badge{display:inline-block;padding:3px 6px;border-radius:5px;font-size:11px;font-weight:700;max-width:270px}
-.badge.high{background:var(--highbg);color:var(--high)}
-.badge.review{background:var(--reviewbg);color:var(--review)}
-.badge.linearized{background:var(--linearbg);color:var(--linear)}
-.badge.normal{background:var(--okbg);color:var(--ok)}
-.badge.error{background:var(--errbg);color:var(--err)}
-tr.high td:first-child{border-left:4px solid var(--high)}
-tr.review td:first-child{border-left:4px solid var(--review)}
-tr.error td:first-child{border-left:4px solid var(--err)}
-.detail-link{font-weight:600;color:#185d91;text-decoration:none}
-.detail-link:hover{text-decoration:underline}
-.section-title{margin:22px 0 9px;font-size:17px}
-.note{color:var(--muted)}
-.kv{display:grid;grid-template-columns:220px 1fr;gap:7px 14px}
-.k{font-weight:600;color:#50606e}
-footer{padding:20px 0;color:var(--muted)}
-.hidden{display:none!important}
-@media print{.toolbar{display:none}.table-wrap{max-height:none;overflow:visible}th{position:static}body{background:#fff}.card{box-shadow:none}}
+:root{--bg:#eef2f5;--panel:#fff;--text:#16202a;--muted:#65727f;--line:#d9e1e7;--navy:#14283b;--high:#982323;--highbg:#fff0f0;--review:#946000;--reviewbg:#fff8e5;--ok:#176944;--okbg:#edf8f2;--linear:#3d5680;--linearbg:#eef3fb;--err:#7c2733;--errbg:#fdecef}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 "Segoe UI",Arial,sans-serif}header{background:var(--navy);color:#fff;padding:24px 30px}header h1{margin:0 0 5px;font-size:24px}header .sub{opacity:.82}main{max-width:1950px;margin:0 auto;padding:20px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:15px;box-shadow:0 1px 2px rgba(0,0,0,.04)}.metric .value{font-size:26px;font-weight:700;line-height:1.1}.metric .label{color:var(--muted);margin-top:5px}.toolbar{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-bottom:12px}.toolbar input,.toolbar select{border:1px solid #c9d3db;border-radius:6px;padding:8px 10px;background:#fff}.toolbar input{min-width:330px;flex:1}.table-wrap{background:#fff;border:1px solid var(--line);border-radius:9px;overflow:auto;max-height:72vh}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1750px}th,td{padding:8px 9px;border-bottom:1px solid #e6ebef;vertical-align:top}th{position:sticky;top:0;z-index:2;background:#eaf0f4;color:#31475b;text-align:left;cursor:pointer;white-space:nowrap}td.num{text-align:right;font-variant-numeric:tabular-nums}td.center{text-align:center}td.file{min-width:340px}.path,.hash{color:var(--muted);font-size:11px;margin-top:2px}.hash{font-family:Consolas,monospace}.badge{display:inline-block;padding:3px 6px;border-radius:5px;font-size:11px;font-weight:700;max-width:270px}.badge.high{background:var(--highbg);color:var(--high)}.badge.review{background:var(--reviewbg);color:var(--review)}.badge.linearized{background:var(--linearbg);color:var(--linear)}.badge.normal{background:var(--okbg);color:var(--ok)}.badge.error{background:var(--errbg);color:var(--err)}tr.high td:first-child{border-left:4px solid var(--high)}tr.review td:first-child{border-left:4px solid var(--review)}tr.error td:first-child{border-left:4px solid var(--err)}.detail-link{font-weight:600;color:#185d91;text-decoration:none}.detail-link:hover{text-decoration:underline}.members{margin-top:7px}.members summary{cursor:pointer;color:#315a78;font-size:12px;font-weight:600}.member-list{margin-top:6px;padding:6px 8px;background:#f7f9fb;border:1px solid #e3e9ee;border-radius:5px;max-height:190px;overflow:auto}.member{display:flex;gap:7px;align-items:flex-start;padding:3px 0}.member code{font-size:11px;word-break:break-all}.rep,.dup{font-size:9px;font-weight:700;border-radius:4px;padding:2px 4px;white-space:nowrap}.rep{background:#e7f6ed;color:#14633d}.dup{background:#eef2f7;color:#596b7a}.section-title{margin:22px 0 9px;font-size:17px}.note{color:var(--muted)}.kv{display:grid;grid-template-columns:230px 1fr;gap:7px 14px}.k{font-weight:600;color:#50606e}.error-list{font-family:Consolas,monospace;font-size:12px}footer{padding:20px 0;color:var(--muted)}.hidden{display:none!important}@media print{.toolbar{display:none}.table-wrap{max-height:none;overflow:visible}th{position:static}body{background:#fff}.card{box-shadow:none}.members[open] .member-list{max-height:none}}
 '@
 
     $js = @'
 (function(){
-  const q=document.getElementById("q"), status=document.getElementById("status"),
-        classf=document.getElementById("classf"), dup=document.getElementById("dup"),
-        rows=[...document.querySelectorAll("#docs tbody tr")], shown=document.getElementById("shown");
-  function apply(){
-    const needle=q.value.toLowerCase().trim(), st=status.value, cl=classf.value, dp=dup.value;
-    let count=0;
-    rows.forEach(r=>{
-      const okQ=!needle||r.innerText.toLowerCase().includes(needle);
-      const okS=!st||r.dataset.status===st;
-      const okC=!cl||r.dataset.assessment===cl;
-      const okD=!dp||(dp==="yes"&&r.dataset.duplicate==="1")||(dp==="no"&&r.dataset.duplicate==="0");
-      const show=okQ&&okS&&okC&&okD;
-      r.classList.toggle("hidden",!show); if(show) count++;
-    });
-    shown.textContent=count.toLocaleString();
-  }
-  [q,status,classf,dup].forEach(x=>x.addEventListener("input",apply));
-  document.querySelectorAll("#docs th").forEach((th,idx)=>{
-    let asc=true;
-    th.addEventListener("click",()=>{
-      const visible=rows.slice().sort((a,b)=>{
-        const ac=a.children[idx], bc=b.children[idx];
-        const av=ac.dataset.sort!==undefined?Number(ac.dataset.sort):ac.innerText.trim().toLowerCase();
-        const bv=bc.dataset.sort!==undefined?Number(bc.dataset.sort):bc.innerText.trim().toLowerCase();
-        if(typeof av==="number"&&typeof bv==="number") return asc?av-bv:bv-av;
-        return asc?String(av).localeCompare(String(bv)):String(bv).localeCompare(String(av));
-      });
-      const tb=document.querySelector("#docs tbody"); visible.forEach(r=>tb.appendChild(r)); asc=!asc;
-    });
-  });
-  apply();
+ const q=document.getElementById("q"),status=document.getElementById("status"),classf=document.getElementById("classf"),dup=document.getElementById("dup"),rows=[...document.querySelectorAll("#docs tbody tr")],shown=document.getElementById("shown");
+ function apply(){const needle=q.value.toLowerCase().trim(),st=status.value,cl=classf.value,dp=dup.value;let count=0;rows.forEach(r=>{const okQ=!needle||r.innerText.toLowerCase().includes(needle),okS=!st||r.dataset.status===st,okC=!cl||r.dataset.assessment===cl,okD=!dp||(dp==="yes"&&r.dataset.duplicate==="1")||(dp==="no"&&r.dataset.duplicate==="0"),show=okQ&&okS&&okC&&okD;r.classList.toggle("hidden",!show);if(show)count++;});shown.textContent=count.toLocaleString();}
+ [q,status,classf,dup].forEach(x=>x.addEventListener("input",apply));
+ document.querySelectorAll("#docs th").forEach((th,idx)=>{let asc=true;th.addEventListener("click",()=>{const sorted=rows.slice().sort((a,b)=>{const ac=a.children[idx],bc=b.children[idx],av=ac.dataset.sort!==undefined?Number(ac.dataset.sort):ac.innerText.trim().toLowerCase(),bv=bc.dataset.sort!==undefined?Number(bc.dataset.sort):bc.innerText.trim().toLowerCase();if(typeof av==="number"&&typeof bv==="number")return asc?av-bv:bv-av;return asc?String(av).localeCompare(String(bv)):String(bv).localeCompare(String(av));});const tb=document.querySelector("#docs tbody");sorted.forEach(r=>tb.appendChild(r));asc=!asc;});});apply();
 })();
 '@
 
-    $title = if ([string]::IsNullOrWhiteSpace($CaseReport.CaseName)) { 'PDF Hexmator' } else { $CaseReport.CaseName }
-
+    $title = if ([string]::IsNullOrWhiteSpace($CaseReport.CaseName)) { 'PDF Hexmator Bulk Forensic Triage' } else { $CaseReport.CaseName }
     $html = New-Object System.Text.StringBuilder
     [void]$html.Append('<!doctype html><html><head><meta charset="utf-8"><title>' + (HtmlEncode $title) + '</title><style>' + $css + '</style></head><body>')
-    [void]$html.Append('<header><h1>' + (HtmlEncode $title) + '</h1><div class="sub">Bulk PDF structural and revision triage · Generated ' + (HtmlEncode $CaseReport.Generated) + '</div></header><main>')
+    [void]$html.Append('<header><h1>' + (HtmlEncode $title) + '</h1><div class="sub">Hash-first PDF forensic triage · Each unique SHA-256 analyzed once · Generated ' + (HtmlEncode $CaseReport.Generated) + '</div></header><main>')
 
     [void]$html.Append('<div class="cards">')
     $metrics = @(
-        [pscustomobject]@{ Label='Documents'; Value=$stats.TotalDocuments },
-        [pscustomobject]@{ Label='Completed'; Value=$stats.Completed },
-        [pscustomobject]@{ Label='Errors'; Value=$stats.Errors },
-        [pscustomobject]@{ Label='Incremental evidence'; Value=$stats.IncrementalEvidence },
-        [pscustomobject]@{ Label='Linearized'; Value=$stats.Linearized },
-        [pscustomobject]@{ Label='Signed'; Value=$stats.Signed },
-        [pscustomobject]@{ Label='Active content'; Value=$stats.ActiveContent },
-        [pscustomobject]@{ Label='Duplicate sets'; Value=$stats.DuplicateSets }
+        [pscustomobject]@{Label='PDFs discovered';Value=$stats.TotalDocuments},
+        [pscustomobject]@{Label='Unique SHA-256';Value=$stats.UniqueHashes},
+        [pscustomobject]@{Label='Deep analyses';Value=$stats.DeepAnalysesPerformed},
+        [pscustomobject]@{Label='Analyses avoided';Value=$stats.DeepAnalysesSaved},
+        [pscustomobject]@{Label='Duplicate sets';Value=$stats.DuplicateSets},
+        [pscustomobject]@{Label='Hash errors';Value=$stats.HashErrors},
+        [pscustomobject]@{Label='Incremental evidence';Value=$stats.UniqueIncrementalEvidence},
+        [pscustomobject]@{Label='Linearized';Value=$stats.UniqueLinearized}
     )
-    foreach ($m in $metrics) {
-        [void]$html.Append('<div class="card metric"><div class="value">' + (HtmlEncode $m.Value) + '</div><div class="label">' + (HtmlEncode $m.Label) + '</div></div>')
-    }
+    foreach($m in $metrics){[void]$html.Append('<div class="card metric"><div class="value">'+(HtmlEncode $m.Value)+'</div><div class="label">'+(HtmlEncode $m.Label)+'</div></div>')}
     [void]$html.Append('</div>')
 
     [void]$html.Append('<div class="card"><div class="kv">')
-    [void]$html.Append('<div class="k">Input</div><div>' + (HtmlEncode ($CaseReport.InputPaths -join '; ')) + '</div>')
-    [void]$html.Append('<div class="k">Recursive</div><div>' + (HtmlEncode $CaseReport.Recurse) + '</div>')
-    [void]$html.Append('<div class="k">Per-document reports</div><div>' + (HtmlEncode $CaseReport.DetailedReports) + '</div>')
-    [void]$html.Append('<div class="k">Extract revisions</div><div>' + (HtmlEncode $CaseReport.ExtractRevisions) + '</div>')
-    [void]$html.Append('<div class="k">PowerShell</div><div>' + (HtmlEncode $CaseReport.PowerShell) + '</div>')
+    [void]$html.Append('<div class="k">Input</div><div>'+(HtmlEncode ($CaseReport.InputPaths -join '; '))+'</div>')
+    [void]$html.Append('<div class="k">Hash-first de-duplication</div><div>Enabled — SHA-256 inventory completed before PDF parsing</div>')
+    [void]$html.Append('<div class="k">Recursive</div><div>'+(HtmlEncode $CaseReport.Recurse)+'</div>')
+    [void]$html.Append('<div class="k">Detailed reports</div><div>'+(HtmlEncode $CaseReport.DetailedReports)+' (one report per unique hash)</div>')
+    [void]$html.Append('<div class="k">Extract revisions</div><div>'+(HtmlEncode $CaseReport.ExtractRevisions)+' (representative unique files only)</div>')
+    [void]$html.Append('<div class="k">PowerShell</div><div>'+(HtmlEncode $CaseReport.PowerShell)+'</div>')
     [void]$html.Append('</div></div>')
 
-    [void]$html.Append('<h2 class="section-title">Documents</h2>')
-    [void]$html.Append('<div class="toolbar"><input id="q" type="search" placeholder="Search filename, path, assessment, producer, hash..."><select id="status"><option value="">All statuses</option><option>Complete</option><option>Error</option></select><select id="classf"><option value="">All assessments</option><option value="high">Strong incremental evidence</option><option value="review">Review / indicators</option><option value="linearized">Linearized</option><option value="normal">Other / no strong history</option><option value="error">Errors</option></select><select id="dup"><option value="">All duplicates</option><option value="yes">Duplicates only</option><option value="no">Unique only</option></select><span class="note">Showing <strong id="shown">' + $docs.Count + '</strong> of ' + $docs.Count + '</span></div>')
-
-    [void]$html.Append('<div class="table-wrap"><table id="docs"><thead><tr>' +
-        '<th>#</th><th>Document</th><th>MB</th><th>Assessment</th><th>PDF</th><th>Linearized</th>' +
-        '<th>Logical Rev.</th><th>EOF</th><th title="Backward / Forward">Prev B/F</th><th>Redefined</th><th>Changed Obj.</th>' +
-        '<th>Signatures</th><th title="External tools available / failures">Ext.</th><th>Active</th><th title="High / Medium findings">H/M</th><th>Producer</th>' +
-        '<th>Modification Date</th><th>Duplicate</th><th>Detail</th></tr></thead><tbody>')
+    [void]$html.Append('<h2 class="section-title">Unique PDF hash groups</h2>')
+    [void]$html.Append('<div class="toolbar"><input id="q" type="search" placeholder="Search any member path, hash, assessment, producer..."><select id="status"><option value="">All statuses</option><option>Complete</option><option>Error</option></select><select id="classf"><option value="">All assessments</option><option value="high">Strong incremental evidence</option><option value="review">Review / indicators</option><option value="linearized">Linearized</option><option value="normal">Other / no strong history</option><option value="error">Errors</option></select><select id="dup"><option value="">All hash groups</option><option value="yes">Duplicate sets only</option><option value="no">Unique-only files</option></select><span class="note">Showing <strong id="shown">'+$groups.Count+'</strong> of '+$groups.Count+' unique hash groups</span></div>')
+    [void]$html.Append('<div class="table-wrap"><table id="docs"><thead><tr><th>#</th><th>Hash group</th><th>Representative / identical files</th><th>Files</th><th>MB</th><th>Assessment</th><th>PDF</th><th>Linearized</th><th>Logical Rev.</th><th>EOF</th><th>Prev B/F</th><th>Changed Obj.</th><th>Signatures</th><th>Active</th><th>H/M</th><th>Producer</th><th>Modification Date</th><th>Detail</th></tr></thead><tbody>')
     [void]$html.Append($rows.ToString())
     [void]$html.Append('</tbody></table></div>')
 
+    if ($hashErrors.Count -gt 0) {
+        [void]$html.Append('<h2 class="section-title">Hashing errors</h2><div class="card error-list">')
+        foreach($e in $hashErrors){[void]$html.Append('<div><strong>'+(HtmlEncode $e.FileName)+'</strong> — '+(HtmlEncode $e.FullPath)+' — '+(HtmlEncode $e.Error)+'</div>')}
+        [void]$html.Append('</div>')
+    }
+
     [void]$html.Append('<h2 class="section-title">Interpretation notes</h2><div class="card"><ul>')
+    [void]$html.Append('<li>Every discovered PDF is hashed first. Byte-identical files share one SHA-256 group and only the representative file receives deep structural analysis.</li>')
+    [void]$html.Append('<li>Nested member paths preserve the location of every identical source PDF without duplicating forensic findings.</li>')
     [void]$html.Append('<li>Incremental-update structures establish multiple physical saved states; they do not establish malicious or improper editing.</li>')
-    [void]$html.Append('<li>Linearized (Fast Web View) PDFs can contain multiple physical EOF/startxref structures as part of normal layout; these are excluded from logical revision scoring where recognized.</li>')
-    [void]$html.Append('<li>A fully rewritten, optimized, rasterized, sanitized, or print-to-PDF document may have been edited even when no incremental history remains.</li>')
-    [void]$html.Append('<li>Duplicate groups are exact SHA-256 duplicates of the complete PDF files.</li>')
-    [void]$html.Append('<li>Metadata is corroborative only and can be stale, absent, or altered. Signature structures are detected but cryptographic trust is not validated.</li>')
+    [void]$html.Append('<li>Recognized linearization-only EOF/startxref structures are excluded from logical revision scoring.</li>')
+    [void]$html.Append('<li>Metadata is corroborative only. Signature structures are detected but cryptographic trust is not independently established.</li>')
     [void]$html.Append('</ul></div>')
-
-    [void]$html.Append('<footer>Generated by PDF Hexmator v2.0.0</footer>')
-    [void]$html.Append('<script>' + $js + '</script></main></body></html>')
-
-    [System.IO.File]::WriteAllText($OutputPath, $html.ToString(), [System.Text.UTF8Encoding]::new($false))
+    [void]$html.Append('<footer>Generated by PDF Hexmator v2.1.1</footer><script>'+$js+'</script></main></body></html>')
+    [System.IO.File]::WriteAllText($OutputPath,$html.ToString(),[System.Text.UTF8Encoding]::new($false))
 }
 
 
@@ -1233,6 +1426,7 @@ function Write-CaseManifest {
         [bool]$DetailedReports,
         [bool]$ExtractRevisions,
         [bool]$ExternalValidation,
+        [bool]$HashFirstDeduplication = $false,
         [string]$Started,
         [string]$Completed
     )
@@ -1241,20 +1435,30 @@ function Write-CaseManifest {
     $artifacts = @(Get-GeneratedArtifactInventory -Root $OutputRoot)
 
     $sourceRows = @($Documents | ForEach-Object {
+        $hashGroup = if ($_.PSObject.Properties['HashGroup']) { [string]$_.HashGroup } else { '' }
+        $groupSize = if ($_.PSObject.Properties['GroupSize']) { [int]$_.GroupSize } else { 1 }
+        $representative = if ($_.PSObject.Properties['RepresentativeFullPath']) { [string]$_.RepresentativeFullPath } else { [string]$_.FullPath }
+        $isRepresentative = if ($_.PSObject.Properties['IsRepresentative']) { [bool]$_.IsRepresentative } else { $true }
+        $status = if ($_.PSObject.Properties['Status']) { [string]$_.Status } else { 'Complete' }
+        $assessment = if ($_.PSObject.Properties['Assessment']) { [string]$_.Assessment } else { '' }
         [pscustomobject]@{
             FileName = $_.FileName
             FullPath = $_.FullPath
             SizeBytes = $_.SizeBytes
             SHA256 = $_.SHA256
-            Status = $_.Status
-            Assessment = $_.Assessment
+            HashGroup = $hashGroup
+            GroupSize = $groupSize
+            RepresentativeFullPath = $representative
+            IsRepresentative = $isRepresentative
+            Status = $status
+            Assessment = $assessment
         }
     })
 
     $manifest = [ordered]@{
         Tool = 'PDF Hexmator'
         Script = 'PDFHexmator.ps1'
-        Version = '2.0.0'
+        Version = '2.1.1'
         ScriptSHA256 = $scriptHash
         CaseName = $CaseName
         Started = $Started
@@ -1269,6 +1473,7 @@ function Write-CaseManifest {
         Options = [ordered]@{
             InputPaths = @($InputPaths)
             Recurse = $Recurse
+            HashFirstDeduplication = $HashFirstDeduplication
             DetailedReports = $DetailedReports
             ExtractRevisions = $ExtractRevisions
             ExternalValidation = $ExternalValidation
@@ -1992,7 +2197,7 @@ function Invoke-PdfFileAnalysis {
     $report = [ordered]@{
         Tool = [ordered]@{
             Name = 'PDF Hexmator'
-            Version = '2.0.0'
+            Version = '2.1.1'
             Generated = (Get-Date).ToString('o')
             PowerShell = $PSVersionTable.PSVersion.ToString()
         }
@@ -2289,7 +2494,7 @@ function Invoke-PdfFileAnalysis {
         }
         [void]$html.Append('</ul></section>')
 
-        [void]$html.Append('<footer>Generated ' + (HtmlEncode (Get-Date).ToString('o')) + ' by PDF Hexmator v2.0.0</footer>')
+        [void]$html.Append('<footer>Generated ' + (HtmlEncode (Get-Date).ToString('o')) + ' by PDF Hexmator v2.1.1</footer>')
         [void]$html.Append('</main></body></html>')
 
         [System.IO.File]::WriteAllText($htmlPath, $html.ToString(), ([System.Text.UTF8Encoding]::new($false)))
@@ -2442,56 +2647,67 @@ if (-not $bulkMode) {
 }
 
 Write-Host ''
-Write-Host 'PDF HEXMATOR' -ForegroundColor Cyan
+Write-Host 'PDF HEXMATOR - BULK FORENSIC TRIAGE' -ForegroundColor Cyan
 Write-Host ('=' * 78)
-Write-Host ("Documents   : {0:N0}" -f $pdfFiles.Count)
-Write-Host ("Recursive   : {0}" -f [bool]$Recurse)
-Write-Host ("Output      : {0}" -f $OutputDirectory)
-Write-Host ("Details     : {0}" -f [bool]$DetailedReports)
-Write-Host ("Revisions   : {0}" -f [bool]$ExtractRevisions)
-Write-Host ("External    : {0}" -f [bool]$ExternalValidation)
-Write-Host ("Manifest    : {0}" -f (-not [bool]$NoManifest))
-Write-Host ("PowerShell  : {0}" -f $PSVersionTable.PSVersion.ToString())
+Write-Host ("PDFs discovered : {0:N0}" -f $pdfFiles.Count)
+Write-Host ("Recursive       : {0}" -f [bool]$Recurse)
+Write-Host ("Output          : {0}" -f $OutputDirectory)
+Write-Host ("Details         : {0}" -f [bool]$DetailedReports)
+Write-Host ("Revisions       : {0}" -f [bool]$ExtractRevisions)
+Write-Host ("External        : {0}" -f [bool]$ExternalValidation)
+Write-Host ("Manifest        : {0}" -f (-not [bool]$NoManifest))
+Write-Host ("PowerShell      : {0}" -f $PSVersionTable.PSVersion.ToString())
 Write-Host ''
 
-$documentsDir = Join-Path $OutputDirectory 'documents'
-if ($DetailedReports -or $ExtractRevisions) {
-    [void](New-Item -ItemType Directory -Path $documentsDir -Force)
+# PHASE 1: Hash every discovered PDF before any deep PDF parsing.
+Write-Host 'Phase 1/2 - Calculating SHA-256 for every PDF...' -ForegroundColor Cyan
+$hashInventory = @(Get-PdfHashInventory -Files $pdfFiles)
+$hashErrors = @($hashInventory | Where-Object { $_.Status -eq 'HashError' })
+$hashGroups = @(New-PdfHashGroups -Inventory $hashInventory)
+$hashedFiles = @($hashInventory | Where-Object { $_.Status -eq 'Hashed' }).Count
+$uniqueHashCount = $hashGroups.Count
+$duplicateSets = @($hashGroups | Where-Object { $_.FileCount -gt 1 }).Count
+$deepAnalysesSaved = [Math]::Max(0, $hashedFiles - $uniqueHashCount)
+$duplicateFiles = [int](Get-SafePropertySum `
+    -InputObject @($hashGroups | Where-Object { $_.FileCount -gt 1 }) `
+    -Property 'FileCount')
+
+Write-Host ("  Hashed successfully : {0:N0}" -f $hashedFiles)
+Write-Host ("  Unique SHA-256      : {0:N0}" -f $uniqueHashCount)
+Write-Host ("  Duplicate sets      : {0:N0}" -f $duplicateSets)
+Write-Host ("  Deep analyses saved : {0:N0}" -f $deepAnalysesSaved)
+Write-Host ("  Hash errors         : {0:N0}" -f $hashErrors.Count)
+Write-Host ''
+
+if ($StopOnError -and $hashErrors.Count -gt 0) {
+    throw ("SHA-256 hashing failed for {0} PDF(s). First error: {1} - {2}" -f $hashErrors.Count,$hashErrors[0].FullPath,$hashErrors[0].Error)
 }
 
-$summaries = New-Object System.Collections.Generic.List[object]
-$total = $pdfFiles.Count
+$documentsDir = Join-Path $OutputDirectory 'documents'
+if ($DetailedReports -or $ExtractRevisions) { [void](New-Item -ItemType Directory -Path $documentsDir -Force) }
 
-for ($i = 0; $i -lt $total; $i++) {
-    $file = $pdfFiles[$i]
+# PHASE 2: Analyze only one representative file for each unique SHA-256.
+Write-Host 'Phase 2/2 - Deep analysis of unique SHA-256 representatives...' -ForegroundColor Cyan
+$groupSummaries = New-Object System.Collections.Generic.List[object]
+$totalUnique = $hashGroups.Count
+
+for ($i = 0; $i -lt $totalUnique; $i++) {
+    $group = $hashGroups[$i]
+    $file = Get-Item -LiteralPath $group.Representative.FullPath
     $index = $i + 1
-    $pct = [int](($index / [double]$total) * 100)
+    $pct = if ($totalUnique -gt 0) { [int](($index / [double]$totalUnique) * 100) } else { 100 }
 
-    Write-Progress -Activity 'PDF Hexmator' `
-        -Status ("[{0:N0}/{1:N0}] {2}" -f $index, $total, $file.Name) `
+    Write-Progress -Activity 'PDF Hexmator - Phase 2 of 2: unique PDF analysis' `
+        -Status ("[{0:N0}/{1:N0}] {2} ({3} source file{4})" -f $index,$totalUnique,$file.Name,$group.FileCount,$(if($group.FileCount -eq 1){''}else{'s'})) `
         -PercentComplete $pct
 
-    $safeBase = Get-SafeFileName -Name $file.BaseName -MaxLength 90
-    $docFolderName = '{0:D6}_{1}' -f $index, $safeBase
-
-    if ($DetailedReports -or $ExtractRevisions) {
-        $docOut = Join-Path $documentsDir $docFolderName
-    }
-    else {
-        # Nothing is written by the per-file analyzer in summary-only mode.
-        $docOut = $OutputDirectory
-    }
-
+    $safeBase = Get-SafeFileName -Name $file.BaseName -MaxLength 76
+    $docFolderName = '{0}_{1}' -f $group.HashGroup,$safeBase
+    $docOut = if ($DetailedReports -or $ExtractRevisions) { Join-Path $documentsDir $docFolderName } else { $OutputDirectory }
     $writeDetailHtml = ([bool]$DetailedReports -and -not [bool]$NoHtml)
     $writeDetailJson = ([bool]$DetailedReports -and -not [bool]$NoJson)
-
-    $detailHtmlRel = if ($writeDetailHtml) {
-        'documents/{0}/{1}.pdf-forensics.html' -f $docFolderName, $file.BaseName
-    } else { '' }
-
-    $detailJsonRel = if ($writeDetailJson) {
-        'documents/{0}/{1}.pdf-forensics.json' -f $docFolderName, $file.BaseName
-    } else { '' }
+    $detailHtmlRel = if ($writeDetailHtml) { 'documents/{0}/{1}.pdf-forensics.html' -f $docFolderName,$file.BaseName } else { '' }
+    $detailJsonRel = if ($writeDetailJson) { 'documents/{0}/{1}.pdf-forensics.json' -f $docFolderName,$file.BaseName } else { '' }
 
     try {
         $report = Invoke-PdfFileAnalysis `
@@ -2504,57 +2720,68 @@ for ($i = 0; $i -lt $total; $i++) {
             -RunExternalValidation ([bool]$ExternalValidation) `
             -ExternalToolsDirectory $ExternalToolsDirectory
 
-        $summary = Convert-AnalysisToBulkSummary `
-            -Report $report `
-            -Index $index `
-            -DetailHtmlRelative $detailHtmlRel `
-            -DetailJsonRelative $detailJsonRel
+        # Defensive verification: the representative deep-analysis hash must equal the phase-one hash.
+        if ([string]$report.File.SHA256 -ne [string]$group.SHA256) {
+            throw ("Representative file changed between hashing and analysis. Expected SHA-256 {0}; analyzed {1}." -f $group.SHA256,$report.File.SHA256)
+        }
 
-        $summaries.Add($summary)
+        $summary = Convert-AnalysisToHashGroupSummary -HashGroup $group -Report $report -DetailHtmlRelative $detailHtmlRel -DetailJsonRelative $detailJsonRel
+        $groupSummaries.Add($summary)
+        foreach ($member in @($group.Files)) {
+            $member.Status = 'Complete'
+            $member.Assessment = $summary.Assessment
+        }
 
         $statusColor = if ($summary.HighFindings -gt 0) { 'Yellow' } else { 'DarkGray' }
-        Write-Host ("[{0,6:N0}/{1:N0}] {2} -> {3}" -f $index, $total, $file.Name, $summary.Assessment) -ForegroundColor $statusColor
+        Write-Host ("[{0,6:N0}/{1:N0}] {2} x{3} -> {4}" -f $index,$totalUnique,$group.HashGroup,$group.FileCount,$summary.Assessment) -ForegroundColor $statusColor
     }
     catch {
-        $errSummary = New-BulkErrorSummary -File $file -Index $index -ErrorRecord $_
-        $summaries.Add($errSummary)
-        Write-Host ("[{0,6:N0}/{1:N0}] ERROR {2}: {3}" -f $index, $total, $file.Name, $_.Exception.Message) -ForegroundColor Red
-
+        $errSummary = New-HashGroupErrorSummary -HashGroup $group -ErrorRecord $_
+        $groupSummaries.Add($errSummary)
+        foreach ($member in @($group.Files)) {
+            $member.Status = 'Error'
+            $member.Assessment = 'ANALYSIS ERROR'
+            $member.Error = $_.Exception.Message
+        }
+        Write-Host ("[{0,6:N0}/{1:N0}] ERROR {2} ({3} file(s)): {4}" -f $index,$totalUnique,$group.HashGroup,$group.FileCount,$_.Exception.Message) -ForegroundColor Red
         if ($StopOnError) {
-            Write-Progress -Activity 'PDF Hexmator' -Completed
+            Write-Progress -Activity 'PDF Hexmator - Phase 2 of 2: unique PDF analysis' -Completed
             throw
         }
     }
 
-    # The analyzer reads one PDF into memory at a time. Periodically encourage reclamation
-    # during very large scans without forcing a collection for every file.
-    if (($index % 100) -eq 0) {
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
-    }
+    if (($index % 100) -eq 0) { [GC]::Collect(); [GC]::WaitForPendingFinalizers() }
 }
+Write-Progress -Activity 'PDF Hexmator - Phase 2 of 2: unique PDF analysis' -Completed
 
-Write-Progress -Activity 'PDF Hexmator' -Completed
+$groupSummaryArray = $groupSummaries.ToArray()
+$completedUnique = @($groupSummaryArray | Where-Object { $_.Status -eq 'Complete' }).Count
+$analysisErrorGroups = @($groupSummaryArray | Where-Object { $_.Status -eq 'Error' }).Count
+$completedSourceFiles = Get-SafePropertySum `
+    -InputObject @($groupSummaryArray | Where-Object { $_.Status -eq 'Complete' }) `
+    -Property 'FileCount'
+$analysisErrorSourceFiles = Get-SafePropertySum `
+    -InputObject @($groupSummaryArray | Where-Object { $_.Status -eq 'Error' }) `
+    -Property 'FileCount'
 
-$summaryArray = $summaries.ToArray()
-$duplicateSetCount = Set-DuplicateGroups -Documents $summaryArray
-
-$completed = @($summaryArray | Where-Object { $_.Status -eq 'Complete' }).Count
-$errors = @($summaryArray | Where-Object { $_.Status -eq 'Error' }).Count
-$incrementalEvidence = @($summaryArray | Where-Object {
-    $_.Assessment -like 'STRONG EVIDENCE*' -or $_.Assessment -like 'INDICATORS CONSISTENT*'
-}).Count
-$linearizedCount = @($summaryArray | Where-Object { $_.Linearized }).Count
-$signedCount = @($summaryArray | Where-Object { $_.SignatureByteRanges -gt 0 }).Count
-$activeCount = @($summaryArray | Where-Object { $_.ActiveContentIndicators -gt 0 }).Count
-$duplicateFiles = @($summaryArray | Where-Object { $_.DuplicateCount -gt 1 }).Count
-$highFindingDocs = @($summaryArray | Where-Object { $_.HighFindings -gt 0 }).Count
-$totalBytes = ($summaryArray | Measure-Object -Property SizeBytes -Sum).Sum
-if ($null -eq $totalBytes) { $totalBytes = 0 }
+$uniqueIncrementalEvidence = @($groupSummaryArray | Where-Object { $_.Assessment -like 'STRONG EVIDENCE*' -or $_.Assessment -like 'INDICATORS CONSISTENT*' }).Count
+$sourceIncrementalEvidence = Get-SafePropertySum `
+    -InputObject @($groupSummaryArray | Where-Object { $_.Assessment -like 'STRONG EVIDENCE*' -or $_.Assessment -like 'INDICATORS CONSISTENT*' }) `
+    -Property 'FileCount'
+$uniqueLinearized = @($groupSummaryArray | Where-Object { $_.Linearized }).Count
+$sourceLinearized = Get-SafePropertySum `
+    -InputObject @($groupSummaryArray | Where-Object { $_.Linearized }) `
+    -Property 'FileCount'
+$uniqueSigned = @($groupSummaryArray | Where-Object { $_.SignatureByteRanges -gt 0 }).Count
+$uniqueActive = @($groupSummaryArray | Where-Object { $_.ActiveContentIndicators -gt 0 }).Count
+$highFindingGroups = @($groupSummaryArray | Where-Object { $_.HighFindings -gt 0 }).Count
+$totalBytes = Get-SafePropertySum `
+    -InputObject @($hashInventory) `
+    -Property 'SizeBytes'
 
 $caseReport = [ordered]@{
     Tool = 'PDF Hexmator'
-    Version = '2.0.0'
+    Version = '2.1.1'
     CaseName = $CaseName
     Generated = (Get-Date).ToString('o')
     Started = $runStarted.ToString('o')
@@ -2562,73 +2789,84 @@ $caseReport = [ordered]@{
     InputPaths = @($Path)
     OutputDirectory = $OutputDirectory
     Recurse = [bool]$Recurse
+    HashFirstDeduplication = $true
     DetailedReports = [bool]$DetailedReports
     ExtractRevisions = [bool]$ExtractRevisions
     ExternalValidation = [bool]$ExternalValidation
     ExternalToolsDirectory = $ExternalToolsDirectory
     ManifestEnabled = (-not [bool]$NoManifest)
     Statistics = [ordered]@{
-        TotalDocuments = $total
-        Completed = $completed
-        Errors = $errors
+        TotalDocuments = $pdfFiles.Count
+        HashedSuccessfully = $hashedFiles
+        HashErrors = $hashErrors.Count
+        UniqueHashes = $uniqueHashCount
+        DeepAnalysesPerformed = $totalUnique
+        DeepAnalysesSucceeded = $completedUnique
+        DeepAnalysisErrorGroups = $analysisErrorGroups
+        DeepAnalysisErrorSourceFiles = [int]$analysisErrorSourceFiles
+        DeepAnalysesSaved = $deepAnalysesSaved
+        CompletedSourceFiles = [int]$completedSourceFiles
         TotalBytes = [long]$totalBytes
-        IncrementalEvidence = $incrementalEvidence
-        Linearized = $linearizedCount
-        Signed = $signedCount
-        ActiveContent = $activeCount
-        DocumentsWithHighFindings = $highFindingDocs
-        DocumentsWithChangedObjects = @($summaryArray | Where-Object { $_.ChangedObjectDefinitions -gt 0 }).Count
-        ExternalValidatorFailures = @($summaryArray | Where-Object { $_.ExternalToolFailures -gt 0 }).Count
-        DuplicateSets = $duplicateSetCount
-        DuplicateFiles = $duplicateFiles
+        DuplicateSets = $duplicateSets
+        DuplicateFiles = [int]$duplicateFiles
+        RedundantCopies = $deepAnalysesSaved
+        UniqueIncrementalEvidence = $uniqueIncrementalEvidence
+        SourceDocumentsWithIncrementalEvidence = [int]$sourceIncrementalEvidence
+        UniqueLinearized = $uniqueLinearized
+        SourceDocumentsLinearized = [int]$sourceLinearized
+        UniqueSigned = $uniqueSigned
+        UniqueActiveContent = $uniqueActive
+        UniqueHashesWithHighFindings = $highFindingGroups
+        UniqueHashesWithChangedObjects = @($groupSummaryArray | Where-Object { $_.ChangedObjectDefinitions -gt 0 }).Count
+        ExternalValidatorFailures = @($groupSummaryArray | Where-Object { $_.ExternalToolFailures -gt 0 }).Count
     }
-    Documents = $summaryArray
+    HashGroups = $groupSummaryArray
+    HashErrors = $hashErrors
     Interpretation = @(
+        'Every discovered PDF is SHA-256 hashed before deep analysis. Byte-identical PDFs are analyzed once per unique hash.',
+        'Each hash group retains all original source paths; findings belong to the byte-identical group rather than being duplicated for every copy.',
         'Incremental-update evidence establishes multiple physical saved states but does not establish malicious or improper editing.',
         'Recognized linearization-only EOF/startxref structures are excluded from logical revision scoring.',
         'A complete rewrite or optimization can remove prior revision evidence.',
         'Metadata is corroborative and can be altered or stale.',
-        'Signature structures are detected but cryptographic certificate/signature validity is not verified.',
-        'Duplicate groups are exact SHA-256 duplicate files.'
+        'Signature structures are detected but cryptographic certificate/signature validity is not verified.'
     )
 }
 
 $csvPath = Join-Path $OutputDirectory 'PDF-Forensic-Bulk-Summary.csv'
+$fileInventoryCsvPath = Join-Path $OutputDirectory 'PDF-Forensic-File-Inventory.csv'
 $jsonPath = Join-Path $OutputDirectory 'PDF-Forensic-Bulk-Summary.json'
 $htmlPath = Join-Path $OutputDirectory 'PDF-Forensic-Bulk-Report.html'
 
 if (-not $NoCsv) {
-    $summaryArray |
-        Select-Object Index,Status,FileName,FullPath,Directory,SizeBytes,SHA256,MD5,PdfVersion,
-            Assessment,Linearized,LinearizationLengthMatch,LogicalRevisions,PhysicalEofMarkers,
-            StartXrefCount,ForwardPrev,BackwardPrev,RedefinedObjects,ChangedObjectDefinitions,SignatureByteRanges,
-            ExternalToolsAvailable,ExternalToolFailures,ActiveContentIndicators,HighFindings,MediumFindings,LowFindings,Producer,Creator,
-            CreationDate,ModificationDate,FileSystemLastWriteTime,DuplicateGroup,DuplicateCount,
-            DetailHtml,DetailJson,Error |
+    $groupSummaryArray |
+        Select-Object Index,HashGroup,Status,SHA256,FileCount,DuplicateCopies,RepresentativeFileName,RepresentativeFullPath,SizeBytes,MD5,PdfVersion,
+            Assessment,Linearized,LinearizationLengthMatch,LogicalRevisions,PhysicalEofMarkers,StartXrefCount,ForwardPrev,BackwardPrev,
+            RedefinedObjects,ChangedObjectDefinitions,SignatureByteRanges,ExternalToolsAvailable,ExternalToolFailures,ActiveContentIndicators,
+            HighFindings,MediumFindings,LowFindings,Producer,Creator,CreationDate,ModificationDate,MemberPaths,DetailHtml,DetailJson,Error |
         Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+
+    $hashInventory |
+        Select-Object Index,Status,FileName,FullPath,Directory,SizeBytes,SHA256,HashGroup,GroupSize,RepresentativeFullPath,IsRepresentative,
+            Assessment,FileSystemLastWriteTime,Error |
+        Export-Csv -LiteralPath $fileInventoryCsvPath -NoTypeInformation -Encoding UTF8
 }
 
-if (-not $NoJson) {
-    [pscustomobject]$caseReport |
-        ConvertTo-Json -Depth 8 |
-        Set-Content -LiteralPath $jsonPath -Encoding UTF8
-}
-
-if (-not $NoHtml) {
-    New-BulkHtmlReport -CaseReport ([pscustomobject]$caseReport) -OutputPath $htmlPath
-}
+if (-not $NoJson) { [pscustomobject]$caseReport | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $jsonPath -Encoding UTF8 }
+if (-not $NoHtml) { New-BulkHtmlReport -CaseReport ([pscustomobject]$caseReport) -OutputPath $htmlPath }
 
 $manifestResult = $null
 if (-not $NoManifest) {
     $manifestResult = Write-CaseManifest `
         -OutputRoot $OutputDirectory `
         -CaseName $CaseName `
-        -Documents $summaryArray `
+        -Documents $hashInventory `
         -InputPaths @($Path) `
         -Recurse ([bool]$Recurse) `
         -DetailedReports ([bool]$DetailedReports) `
         -ExtractRevisions ([bool]$ExtractRevisions) `
         -ExternalValidation ([bool]$ExternalValidation) `
+        -HashFirstDeduplication $true `
         -Started $runStarted.ToString('o') `
         -Completed (Get-Date).ToString('o')
 }
@@ -2638,20 +2876,25 @@ $elapsed = (Get-Date) - $runStarted
 Write-Host ''
 Write-Host ('=' * 78)
 Write-Host 'BULK TRIAGE COMPLETE' -ForegroundColor Cyan
-Write-Host ("Processed             : {0:N0}" -f $total)
-Write-Host ("Completed             : {0:N0}" -f $completed)
-Write-Host ("Errors                : {0:N0}" -f $errors)
-Write-Host ("Incremental evidence  : {0:N0}" -f $incrementalEvidence)
-Write-Host ("Linearized PDFs       : {0:N0}" -f $linearizedCount)
-Write-Host ("Signed PDFs           : {0:N0}" -f $signedCount)
-Write-Host ("Active-content PDFs   : {0:N0}" -f $activeCount)
-Write-Host ("Duplicate sets/files  : {0:N0} / {1:N0}" -f $duplicateSetCount, $duplicateFiles)
-Write-Host ("Elapsed               : {0}" -f $elapsed.ToString('hh\:mm\:ss'))
-Write-Host ("Output                : {0}" -f $OutputDirectory)
-if (-not $NoHtml) { Write-Host ("HTML                  : {0}" -f $htmlPath) }
-if (-not $NoCsv)  { Write-Host ("CSV                   : {0}" -f $csvPath) }
-if (-not $NoJson) { Write-Host ("JSON                  : {0}" -f $jsonPath) }
-if ($manifestResult) { Write-Host ("Manifest              : {0}" -f $manifestResult.Json); Write-Host ("SHA256SUMS            : {0}" -f $manifestResult.Sha256Sums) }
+Write-Host ("PDFs discovered        : {0:N0}" -f $pdfFiles.Count)
+Write-Host ("SHA-256 hashed         : {0:N0}" -f $hashedFiles)
+Write-Host ("Unique SHA-256         : {0:N0}" -f $uniqueHashCount)
+Write-Host ("Deep analyses run      : {0:N0}" -f $totalUnique)
+Write-Host ("Deep analyses saved    : {0:N0}" -f $deepAnalysesSaved)
+Write-Host ("Duplicate sets/files   : {0:N0} / {1:N0}" -f $duplicateSets,$duplicateFiles)
+Write-Host ("Hash errors            : {0:N0}" -f $hashErrors.Count)
+Write-Host ("Analysis error groups  : {0:N0}" -f $analysisErrorGroups)
+Write-Host ("Incremental evidence   : {0:N0} unique hash group(s)" -f $uniqueIncrementalEvidence)
+Write-Host ("Linearized PDFs        : {0:N0} unique hash group(s)" -f $uniqueLinearized)
+Write-Host ("Elapsed                : {0}" -f $elapsed.ToString('hh\:mm\:ss'))
+Write-Host ("Output                 : {0}" -f $OutputDirectory)
+if (-not $NoHtml) { Write-Host ("HTML                   : {0}" -f $htmlPath) }
+if (-not $NoCsv)  {
+    Write-Host ("Hash-group CSV         : {0}" -f $csvPath)
+    Write-Host ("File inventory CSV     : {0}" -f $fileInventoryCsvPath)
+}
+if (-not $NoJson) { Write-Host ("JSON                   : {0}" -f $jsonPath) }
+if ($manifestResult) { Write-Host ("Manifest               : {0}" -f $manifestResult.Json) }
 Write-Host ''
 
 [pscustomobject]$caseReport
