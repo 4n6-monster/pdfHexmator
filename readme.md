@@ -4,13 +4,14 @@
 
 It is designed for **single-document analysis** and **high-volume folder triage** involving hundreds or thousands of PDFs. The tool emphasizes conservative interpretation: it reports observable structures and corroborating indicators rather than treating metadata or multiple `%%EOF` markers alone as proof that a document was improperly edited.
 
-> **Version:** 2.0.0  
+> **Version:** 2.1.1  
 > **Script:** `PDFHexmator.ps1`  
 > **PowerShell:** Windows PowerShell 5.1+ or PowerShell 7+  
 > **Required dependencies:** None beyond PowerShell/.NET  
 > **Optional corroboration:** qpdf, ExifTool, pdfsig, Didier Stevens' `pdfid.py`
 
-![PDF Hexmator bulk dashboard](images/bulk-dashboard.png)
+![PDF Hexmator hash-first bulk dashboard](images/bulk-dashboard.png)
+
 
 ## Quick overview
 
@@ -32,7 +33,9 @@ PDF Hexmator examines PDFs for indicators including:
 - `/DocMDP` and `/FieldMDP`
 - JavaScript, OpenAction, Launch, embedded files, RichMedia, AcroForm, and XFA indicators
 - MD5 and SHA-256 hashing
-- exact SHA-256 duplicate grouping in bulk collections
+- **hash-first SHA-256 de-duplication before deep analysis**
+- one deep analysis per unique SHA-256 rather than per source file
+- nested reporting of all identical source paths beneath the analyzed hash group
 - recoverable logical revision carving
 - optional external corroboration with third-party PDF utilities
 - case-level manifests and output hash inventories
@@ -98,16 +101,16 @@ Duplicate input paths are de-duplicated during target discovery.
 | `-Path` | One or more PDF files, directories, or wildcard paths. |
 | `-Recurse` | Includes PDFs in nested subdirectories. |
 | `-OutputDirectory` | Destination for reports, manifests, and carved revisions. |
-| `-DetailedReports` | Generates full per-document HTML/JSON reports in bulk mode. |
+| `-DetailedReports` | Generates one full HTML/JSON report per unique SHA-256 hash group in bulk mode. |
 | `-ExtractRevisions` | Carves recoverable logical PDF revisions. |
 | `-CaseName` | Friendly title for the consolidated report and case manifest. |
 | `-ExternalValidation` | Attempts corroborating checks with supported third-party utilities. |
 | `-ExternalToolsDirectory` | Optional directory containing external validation tools. |
 | `-NoHtml` | Disables HTML output. |
 | `-NoJson` | Disables JSON output. |
-| `-NoCsv` | Disables consolidated CSV output in bulk mode. |
+| `-NoCsv` | Disables both the hash-group summary CSV and full source-file inventory CSV in bulk mode. |
 | `-NoManifest` | Disables the case manifest and `SHA256SUMS.txt`. |
-| `-StopOnError` | Stops bulk processing on the first per-document error. |
+| `-StopOnError` | Stops bulk processing on the first hashing or unique-analysis error. |
 
 By default, an error in one PDF is recorded and the bulk run continues.
 
@@ -119,14 +122,15 @@ A typical bulk run produces:
 PDF-Analysis\
 │
 ├── PDF-Forensic-Bulk-Report.html
-├── PDF-Forensic-Bulk-Summary.csv
-├── PDF-Forensic-Bulk-Summary.json
+├── PDF-Forensic-Bulk-Summary.csv          # one row per unique SHA-256
+├── PDF-Forensic-File-Inventory.csv        # every source PDF mapped to its hash group
+├── PDF-Forensic-Bulk-Summary.json         # nested hash groups + member files
 ├── PDFHexmator-Case-Manifest.json
 ├── PDFHexmator-Case-Manifest.csv
 ├── SHA256SUMS.txt
 │
 └── documents\
-    ├── 000001_document-one\
+    ├── HASH-000001_document-one\
     │   ├── document-one.pdf-forensics.html
     │   ├── document-one.pdf-forensics.json
     │   ├── document-one.revision-object-diff.csv
@@ -134,31 +138,71 @@ PDF-Analysis\
     └── ...
 ```
 
-The `documents` tree is created when detailed reports and/or revision extraction are requested.
+The `documents` tree is created when detailed reports and/or revision extraction are requested. It contains **one directory per unique hash**, not one directory per source-file copy.
 
 ## Consolidated HTML report
 
-The bulk HTML report is self-contained, searchable, and sortable. It summarizes:
+Bulk processing is **hash-first** in v2.1.1:
 
-- total/completed/error counts
-- incremental-update indicators
-- linearized PDFs
+```text
+Discover PDFs
+    ↓
+SHA-256 every source PDF
+    ↓
+Group byte-identical files
+    ↓
+Select one representative per unique SHA-256
+    ↓
+Deep PDF analysis only on representatives
+    ↓
+Nest all identical source paths beneath the representative hash group
+```
+
+This means a collection containing 10,000 PDFs but only 7,000 unique SHA-256 values performs **7,000 deep PDF analyses**, while still preserving all 10,000 source paths in the report and manifest.
+
+The bulk HTML report is self-contained, searchable, and sortable. Its primary row is a **unique hash group**, not an individual duplicate file. Each row includes an expandable list of all byte-identical PDFs in that group and clearly marks the representative file that was actually analyzed.
+
+The dashboard reports:
+
+- total PDFs discovered
+- successfully hashed PDFs
+- unique SHA-256 values
+- deep analyses performed
+- deep analyses avoided through de-duplication
+- duplicate sets and redundant copies
+- hash failures
+- incremental-update indicators by unique hash
+- linearized PDFs by unique hash
 - signature structures
 - active-content indicators
-- duplicate sets
-- logical revisions
-- physical EOF markers
+- logical revisions and physical EOF markers
 - backward/forward `/Prev` counts
-- redefined objects
-- **changed object definitions**
+- changed object definitions
 - optional external-validator status
 - Producer/Creator metadata
 - modification dates
-- links to per-document reports
+- links to the single detailed report associated with each unique hash
+
+### Nested duplicate example
+
+A report row may represent:
+
+```text
+HASH-000042
+SHA-256: 7A8C...D91F
+Representative: D:\Evidence\Email\invoice.pdf   [ANALYZED]
+
+3 identical PDFs
+  ├─ D:\Evidence\Email\invoice.pdf             [ANALYZED]
+  ├─ D:\Evidence\Exports\invoice-copy.pdf      [IDENTICAL]
+  └─ E:\Production\Batch7\000124.pdf           [IDENTICAL]
+```
+
+All three paths remain evidentially visible, but the PDF parser, revision analyzer, external validators, and detailed-report generator run only once against the representative bytes.
 
 ## Object-level revision diffing
 
-Version 2.0.0 adds object-level comparison for repeated indirect object IDs.
+Version 2.0.0 introduced object-level comparison for repeated indirect object IDs.
 
 When the same object/generation pair appears more than once, PDF Hexmator records each serialized object definition and calculates a SHA-256 hash. The report then compares adjacent definitions:
 
@@ -172,9 +216,10 @@ Object 17 0
 
 This helps move the analysis from **“the file contains revisions”** toward **“these object definitions changed between revisions.”**
 
-![PDF Hexmator detailed report](images/document-report.png)
 
 > Object-level diffing compares serialized indirect-object definitions. It does not yet render a page-level visual diff or semantically decode every stream.
+
+![PDF Hexmator detailed report](images/document-report.png)
 
 ## Linearized PDFs / Fast Web View
 
@@ -197,7 +242,7 @@ Recognized linearization-only bootstrap structures are excluded from incremental
 
 Use `-ExternalValidation` to attempt corroborating analysis with locally installed utilities.
 
-Supported integrations in v2.0.0:
+Supported integrations:
 
 | Tool | Purpose |
 |---|---|
@@ -251,17 +296,28 @@ The manifest records:
 
 This is intended to make a completed triage run easier to reproduce, audit, and preserve with case materials.
 
-## Duplicate detection
+## Hash-first duplicate handling
 
-Bulk mode groups byte-for-byte identical PDFs by complete-file SHA-256.
+Starting with v2.1.1, duplicate detection occurs **before** structural PDF analysis.
+
+Every discovered PDF receives a complete-file SHA-256. Files with the same SHA-256 are byte-for-byte identical and are assigned to the same hash group:
 
 ```text
-DUP-0001 (6 files)
-DUP-0002 (3 files)
-DUP-0003 (2 files)
+HASH-000001  SHA256=A1B2...  1 file
+HASH-000002  SHA256=7A8C...  6 identical files
+HASH-000003  SHA256=CC91...  3 identical files
 ```
 
-Visually identical files with different binary representations will not be grouped together.
+Only the first deterministic representative in each group is deeply analyzed. The resulting forensic findings apply to all members because their complete file bytes are identical.
+
+Two output views preserve both levels of information:
+
+- **`PDF-Forensic-Bulk-Summary.csv`** — one row per unique SHA-256 / deep analysis.
+- **`PDF-Forensic-File-Inventory.csv`** — one row per discovered PDF, including hash group, representative path, group size, and whether that file was the analyzed representative.
+
+The JSON and HTML reports nest identical files beneath their hash group. This prevents duplicate copies from inflating finding counts while preserving all original source locations.
+
+Visually identical PDFs with different binary content will have different SHA-256 values and will be analyzed separately.
 
 ## Digital signatures
 
@@ -358,13 +414,30 @@ Normal forensic evidence-handling procedures should still be followed, including
 
 ## Performance
 
-Bulk processing is sequential by design for compatibility with Windows PowerShell 5.1 and predictable memory use. One PDF is analyzed at a time rather than loading an entire collection into memory.
+Bulk processing uses two sequential phases for Windows PowerShell 5.1 compatibility and predictable memory usage:
+
+1. **Hash inventory** — SHA-256 every discovered PDF without deep parsing.
+2. **Unique analysis** — deeply analyze one representative for each unique SHA-256.
+
+Only one file is actively processed at a time. This preserves predictable memory use while avoiding repeated structural analysis, external-tool execution, revision extraction, and detailed-report generation for byte-identical copies.
+
+Example:
+
+```text
+PDFs discovered       25,000
+Unique SHA-256        14,200
+Redundant copies      10,800
+Deep analyses run     14,200
+Deep analyses avoided 10,800
+```
+
+The representative SHA-256 is checked again during deep analysis. If the file changes between the hash-inventory phase and analysis phase, the group is reported as an error instead of silently applying stale results.
 
 ## Recommended workflow
 
-1. Run PDF Hexmator across the full collection.
-2. Review the consolidated HTML dashboard.
-3. Filter the CSV for:
+1. Run PDF Hexmator across the full collection; the tool hashes everything first and automatically reduces the set to unique SHA-256 values.
+2. Review the consolidated HTML dashboard and expand hash groups when source-location context matters.
+3. Filter the hash-group CSV for:
    - backward `/Prev`
    - multiple logical revisions
    - changed/redefined objects
@@ -372,8 +445,8 @@ Bulk processing is sequential by design for compatibility with Windows PowerShel
    - post-signature bytes
    - unusual Producer metadata
    - active content
-4. De-prioritize exact duplicates where appropriate.
-5. Open per-document detailed reports for files of interest.
+4. Use `PDF-Forensic-File-Inventory.csv` when you need every original path associated with a hash group.
+5. Open the single detailed report for each unique hash of interest.
 6. Review object-level revision diffs.
 7. Extract recoverable revisions.
 8. Corroborate important findings with a second standards-aware tool.
@@ -384,7 +457,7 @@ Bulk processing is sequential by design for compatibility with Windows PowerShel
 The repository contains synthetic regression fixtures covering:
 
 - normal PDF
-- exact duplicate
+- exact duplicate with hash-first single-analysis validation
 - incremental update
 - multiple revisions
 - linearized PDF
@@ -414,14 +487,15 @@ PDF-Hexmator/
 ├── PDFHexmator.ps1
 ├── README.md
 ├── CHANGELOG.md
-├── RELEASE_NOTES_v2.0.0.md
+├── RELEASE_NOTES_v2.1.1.md
 ├── LICENSE
 ├── CONTRIBUTING.md
 ├── SECURITY.md
 │
-├── images/
-│   ├── bulk-dashboard.png
-│   └── document-report.png
+├── docs/
+│   └── images/
+│       ├── bulk-dashboard.png
+│       └── document-report.png
 │
 ├── tests/
 │   ├── PDFHexmator.Tests.ps1
